@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Voice Assistant</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+        button { padding: 15px 30px; font-size: 18px; cursor: pointer; margin: 10px; }
+        #status { margin-top: 20px; font-style: italic; }
+        .vad-indicator {
+            width: 20px; height: 20px; border-radius: 50%; 
+            background-color: gray; display: inline-block;
+            margin-left: 10px;
+        }
+        .vad-active { background-color: green; }
+    </style>
+</head>
+<body>
+    <h1>Voice Assistant</h1>
+    <button id="startBtn">Start Conversation</button>
+    <button id="stopBtn" disabled>Stop Conversation</button>
+    <div id="status">Ready to connect</div>
+    <div>VAD Status: <span id="vadIndicator" class="vad-indicator"></span></div>
+    
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusEl = document.getElementById('status');
+        const vadIndicator = document.getElementById('vadIndicator');
+        let mediaRecorder;
+        let audioContext;
+        let ws;
+
+        async function setupAudio() {
+            try {
+                statusEl.textContent = 'Setting up audio...';
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+                
+                mediaRecorder.ondataavailable = async (event) => {
+                    if (ws && ws.readyState === WebSocket.OPEN && event.data.size > 0) {
+                        ws.send(await event.data.arrayBuffer());
+                    }
+                };
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                statusEl.textContent = 'Audio ready! Click Start Conversation';
+            } catch (error) {
+                statusEl.textContent = `Audio error: ${error.message}`;
+            }
+        }
+
+        function playAudioChunk(data) {
+            // Convert binary data to audio buffer
+            audioContext.decodeAudioData(data).then(audioBuffer => {
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+            });
+        }
+
+        startBtn.addEventListener('click', async () => {
+            if (!mediaRecorder) await setupAudio();
+            
+            statusEl.textContent = 'Connecting...';
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+            ws.binaryType = 'arraybuffer';
+            
+            ws.onopen = () => {
+                statusEl.textContent = 'Connected! Speak now...';
+                mediaRecorder.start(100);  // 100ms chunks
+            };
+            
+            ws.onmessage = (event) => {
+                // Check if message is VAD status update
+                if (typeof event.data === 'string') {
+                    if (event.data === 'VAD_START') {
+                        vadIndicator.classList.add('vad-active');
+                    } else if (event.data === 'VAD_STOP') {
+                        vadIndicator.classList.remove('vad-active');
+                    }
+                } else {
+                    playAudioChunk(event.data);
+                }
+            };
+            
+            ws.onclose = () => {
+                statusEl.textContent = 'Connection closed';
+                if (mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop();
+                }
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+                vadIndicator.classList.remove('vad-active');
+            };
+        });
+
+        stopBtn.addEventListener('click', () => {
+            if (ws) {
+                ws.close();
+            }
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+            statusEl.textContent = 'Connection stopped';
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        });
+    </script>
+</body>
+</html>

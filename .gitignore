@@ -16,6 +16,7 @@ dist/
 .venv
 env/
 venv/
+venv-linux/
 ENV/
 .mypy_cache/
 .dmypy.json

@@ -1,102 +1,31 @@
-#
-# Copyright (c) 2024–2025, Daily
-#
-# SPDX-License-Identifier: BSD 2-Clause License
-#
-
-"""RTVI Bot Server Implementation.
-
-This FastAPI server manages RTVI bot instances and provides endpoints for both
-direct browser access and RTVI client connections. It handles:
-- Creating Daily rooms
-- Managing bot processes
-- Providing connection credentials
-- Monitoring bot status
-
-Requirements:
-- Daily API key (set in .env file)
-- Python 3.10+
-- FastAPI
-- Running bot implementation
-"""
+# server.py
 
 import uvicorn
-import argparse
 import os
 import logging
 import subprocess
-from contextlib import asynccontextmanager
-from typing import Any, Dict
-from logger_config import logger
-
 import asyncio
-import aiohttp
+import websockets
+from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 
-# from bot import main
+from pipecat.transports.network.fastapi_websocket import (
+    FastAPIWebsocketTransport,
+    FastAPIWebsocketParams
+)
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
+from pipecat.serializers.twilio import TwilioFrameSerializer
 
-from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper, DailyRoomParams
-# from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
-
-# Load environment variables from .env file
 load_dotenv(override=True)
-
 logger = logging.getLogger("pc")
 
-# Maximum number of bot instances allowed per room
-MAX_BOTS_PER_ROOM = 1
+bot_procs = {}        # pid -> (process, conn_id)
+connections = {}      # conn_id -> user WebSocket
+bot_ws_map = {}       # conn_id -> bot WebSocket
 
-# Dictionary to track bot processes: {pid: (process, room_url)}
-bot_procs = {}
-
-# Store Daily API helpers
-daily_helpers = {}
-
-# pcs_map: Dict[str, SmallWebRTCConnection] = {}
-
-
-def cleanup():
-    """Cleanup function to terminate all bot processes.
-
-    Called during server shutdown.
-    """
-    for entry in bot_procs.values():
-        proc = entry[0]
-        proc.terminate()
-        proc.wait()
-
-
-def get_bot_file():
-    return "bot"
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """FastAPI lifespan manager that handles startup and shutdown tasks.
-
-    - Creates aiohttp session
-    - Initializes Daily API helper
-    - Cleans up resources on shutdown
-    """
-    aiohttp_session = aiohttp.ClientSession()
-    daily_helpers["rest"] = DailyRESTHelper(
-        daily_api_key=os.getenv("DAILY_API_KEY", ""),
-        daily_api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
-        aiohttp_session=aiohttp_session,
-    )
-    yield
-    await aiohttp_session.close()
-    cleanup()
-
-
-# Initialize FastAPI app with lifespan manager
-app = FastAPI(lifespan=lifespan)
-
-# Configure CORS to allow requests from any origin
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -104,140 +33,191 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-async def create_room_and_token() -> tuple[str, str]:
-    """Helper function to create a Daily room and generate an access token.
-
-    Returns:
-        tuple[str, str]: A tuple containing (room_url, token)
-
-    Raises:
-        HTTPException: If room creation or token generation fails
-    """
-    room = await daily_helpers["rest"].create_room(DailyRoomParams())
-    if not room.url:
-        raise HTTPException(status_code=500, detail="Failed to create room")
-
-    token = await daily_helpers["rest"].get_token(room.url)
-    if not token:
-        raise HTTPException(status_code=500, detail=f"Failed to get token for room: {room.url}")
-
-    return room.url, token
-
-
 @app.get("/")
-async def start_agent(request: Request):
-    """Endpoint for direct browser access to the bot.
+async def serve_ui():
+    return FileResponse("frontend/index.html")
 
-    Creates a room, starts a bot instance, and redirects to the Daily room URL.
+@app.websocket("/ws")
+async def user_ws(websocket: WebSocket):
+    await websocket.accept()
+    conn_id = id(websocket)
+    connections[conn_id] = websocket
 
-    Returns:
-        RedirectResponse: Redirects to the Daily room URL
-
-    Raises:
-        HTTPException: If room creation, token generation, or bot startup fails
-    """
-    print("Creating room")
-    room_url, token = await create_room_and_token()
-    print(f"Room URL: {room_url}")
-
-    # Check if there is already an existing process running in this room
-    num_bots_in_room = sum(
-        1 for proc in bot_procs.values() if proc[1] == room_url and proc[0].poll() is None
-    )
-    if num_bots_in_room >= MAX_BOTS_PER_ROOM:
-        raise HTTPException(status_code=500, detail=f"Max bot limit reached for room: {room_url}")
-
-    # Spawn a new bot process
     try:
-        bot_file = get_bot_file()
         proc = subprocess.Popen(
-            ["python3", "-m", bot_file, "-u", room_url, "-t", token],
-            shell=False,
-            bufsize=1,
+            ["python3", "-m", "bot", "--connection_id", str(conn_id)],
             cwd=os.path.dirname(os.path.abspath(__file__)),
+            shell=False
         )
-        bot_procs[proc.pid] = (proc, room_url)
+        bot_procs[proc.pid] = (proc, conn_id)
+        logger.info(f"Started bot process {proc.pid} for connection {conn_id}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
+        logger.error(f"Bot startup failed: {e}")
+        await websocket.close(code=1011, reason="Bot startup failed")
+        return
 
-    return RedirectResponse(room_url)
-
-
-@app.post("/connect")
-async def rtvi_connect(request: Request) -> Dict[Any, Any]:
-    """RTVI connect endpoint that creates a room and returns connection credentials.
-
-    This endpoint is called by RTVI clients to establish a connection.
-
-    Returns:
-        Dict[Any, Any]: Authentication bundle containing room_url and token
-
-    Raises:
-        HTTPException: If room creation, token generation, or bot startup fails
-    """
-    print("Creating room for RTVI connection")
-    room_url, token = await create_room_and_token()
-    print(f"Room URL: {room_url}")
-
-    # Start the bot process
     try:
-        bot_file = get_bot_file()
-        proc = subprocess.Popen(
-            ["python3", "-m", bot_file, "-u", room_url, "-t", token],
-            shell=False,
-            bufsize=1,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+        while True:
+            data = await websocket.receive_bytes()
+            # Forward binary frames to bot
+            if conn_id in bot_ws_map:
+                await bot_ws_map[conn_id].send_bytes(data)
+            # Optionally log VAD signals
+            if data.startswith(b"VAD:"):
+                status = data.decode().split(":", 1)[1]
+                await websocket.send_text(f"VAD_{status}")
+    except:
+        logger.info(f"User connection {conn_id} closed")
+    finally:
+        connections.pop(conn_id, None)
+        proc, _ = bot_procs.pop(proc.pid, (None, None))
+        if proc:
+            proc.terminate()
+        bot_ws_map.pop(conn_id, None)
+
+# @app.websocket("/bot_ws/{conn_id}")
+# async def bot_ws(websocket: WebSocket, conn_id: str):
+#     await websocket.accept()
+#     conn_id = int(conn_id)
+#     if conn_id not in connections:
+#         await websocket.close(code=1008, reason="Invalid connection ID")
+#         return
+
+#     bot_ws_map[conn_id] = websocket
+#     user_ws = connections[conn_id]
+
+#     # Wrap transport around bot->server WebSocket
+#     transport = FastAPIWebsocketTransport(
+#         websocket=websocket,
+#         params=FastAPIWebsocketParams(
+#             audio_in_enabled=True,
+#             audio_out_enabled=True,
+#             vad_enabled=True,
+#             serializer=TwilioFrameSerializer(stream_sid="dummy")
+#         )
+#     )
+
+    # # Forward audio in both directions
+    # async def recv_from_bot():
+    #     async for frame in transport.input():
+    #         await user_ws.send_bytes(frame)
+
+    # async def send_to_bot():
+    #     async for frame in transport.output():
+    #         await websocket.send_bytes(frame)
+
+    # try:
+    #     await asyncio.gather(recv_from_bot(), send_to_bot())
+    # finally:
+    #     logger.info(f"Bot connection closed for {conn_id}")
+    #     bot_ws_map.pop(conn_id, None)
+    
+    
+    
+    
+    
+    # In server.py - bot_ws endpoint
+@app.websocket("/bot_ws/{conn_id_str}")
+async def bot_ws(websocket: WebSocket, conn_id_str: str):
+    try:
+        conn_id = int(conn_id_str)
+        if conn_id not in connections:
+            await websocket.close(code=1008, reason="Invalid connection ID")
+            return
+            
+        await websocket.accept()
+        bot_ws_map[conn_id] = websocket
+        user_ws = connections[conn_id]
+
+        transport = FastAPIWebsocketTransport(
+            websocket=websocket,
+            params=FastAPIWebsocketParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                serializer=TwilioFrameSerializer(stream_sid="dummy")
+            )
         )
-        bot_procs[proc.pid] = (proc, room_url)
+
+        # Define tasks with proper error handling
+        async def recv_from_bot():
+            try:
+                while True:
+                    try:
+                        frame = await transport.receive_frame()
+                        if frame:
+                            await user_ws.send_bytes(frame)
+                    except websockets.exceptions.ConnectionClosedOK:
+                        logger.info("Bot connection closed normally (recv)")
+                        break
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        logger.error(f"Bot connection closed with error (recv): {e}")
+                        break
+                    except Exception as e:
+                        logger.error(f"Error receiving from bot: {e}")
+                        # Continue for transient errors
+            except asyncio.CancelledError:
+                logger.info("recv_from_bot task cancelled")
+            except Exception as e:
+                logger.error(f"Critical error in recv_from_bot: {e}")
+
+        async def send_to_bot():
+            try:
+                while True:
+                    try:
+                        # Use queue.get() with timeout
+                        frame = await asyncio.wait_for(transport.output().get(), timeout=1.0)
+                        if frame:
+                            await websocket.send_bytes(frame)
+                    except asyncio.TimeoutError:
+                        # Normal timeout, continue
+                        continue
+                    except websockets.exceptions.ConnectionClosedOK:
+                        logger.info("Bot connection closed normally (send)")
+                        break
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        logger.error(f"Bot connection closed with error (send): {e}")
+                        break
+                    except Exception as e:
+                        logger.error(f"Error sending to bot: {e}")
+            except asyncio.CancelledError:
+                logger.info("send_to_bot task cancelled")
+            except Exception as e:
+                logger.error(f"Critical error in send_to_bot: {e}")
+
+        # Create and run tasks
+        recv_task = asyncio.create_task(recv_from_bot())
+        send_task = asyncio.create_task(send_to_bot())
+        
+        try:
+            await asyncio.gather(recv_task, send_task)
+        except asyncio.CancelledError:
+            logger.info("WebSocket tasks cancelled")
+        finally:
+            # Cancel tasks if still running
+            if not recv_task.done():
+                recv_task.cancel()
+            if not send_task.done():
+                send_task.cancel()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
-
-    # Return the authentication bundle in format expected by DailyTransport
-    return {"room_url": room_url, "token": token}
-
+        logger.error(f"Unexpected error in bot_ws: {e}")
+    finally:
+        # Cleanup outside the task context
+        if 'conn_id' in locals():
+            logger.info(f"Bot connection closed for {conn_id}")
+            bot_ws_map.pop(conn_id, None)
+    
+    
 
 @app.get("/status/{pid}")
-def get_status(pid: int):
-    """Get the status of a specific bot process.
-
-    Args:
-        pid (int): Process ID of the bot
-
-    Returns:
-        JSONResponse: Status information for the bot
-
-    Raises:
-        HTTPException: If the specified bot process is not found
-    """
-    # Look up the subprocess
-    proc = bot_procs.get(pid)
-
-    # If the subprocess doesn't exist, return an error
-    if not proc:
-        raise HTTPException(status_code=404, detail=f"Bot with process id: {pid} not found")
-
-    # Check the status of the subprocess
-    status = "running" if proc[0].poll() is None else "finished"
-    return JSONResponse({"bot_id": pid, "status": status})
-
+def status(pid: int):
+    proc_info = bot_procs.get(pid)
+    if not proc_info:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    proc = proc_info[0]
+    state = "running" if proc.poll() is None else "finished"
+    return JSONResponse({"bot_id": pid, "status": state})
 
 if __name__ == "__main__":
-    # Parse command line arguments for server configuration
-    default_host = os.getenv("HOST", "0.0.0.0")
-    default_port = int(os.getenv("FAST_API_PORT", "7860"))
-
-    parser = argparse.ArgumentParser(description="Daily FastAPI server")
-    parser.add_argument("--host", type=str, default=default_host, help="Host address")
-    parser.add_argument("--port", type=int, default=default_port, help="Port number")
-    parser.add_argument("--reload", action="store_true", help="Reload code on change")
-
-    config = parser.parse_args()
-
-    # Start the FastAPI server
-    uvicorn.run(
-        "server:app",
-        host=config.host,
-        port=config.port,
-        reload=config.reload,
-    )
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("FAST_API_PORT", "7860"))
+    uvicorn.run("server:app", host=host, port=port, reload=False)
