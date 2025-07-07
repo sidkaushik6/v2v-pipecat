@@ -27,8 +27,62 @@
         const statusEl = document.getElementById('status');
         const vadIndicator = document.getElementById('vadIndicator');
         let mediaRecorder;
-        let audioContext;
         let ws;
+
+        // Audio Player with buffering
+        class AudioPlayer {
+            constructor() {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                this.audioQueue = [];
+                this.isPlaying = false;
+                this.source = null;
+            }
+
+            async playChunk(data) {
+                this.audioQueue.push(data);
+                if (!this.isPlaying) {
+                    this._processQueue();
+                }
+            }
+
+            async _processQueue() {
+                if (this.audioQueue.length === 0) {
+                    this.isPlaying = false;
+                    return;
+                }
+                
+                this.isPlaying = true;
+                const data = this.audioQueue.shift();
+                
+                try {
+                    const audioBuffer = await this.audioContext.decodeAudioData(data);
+                    this.source = this.audioContext.createBufferSource();
+                    this.source.buffer = audioBuffer;
+                    this.source.connect(this.audioContext.destination);
+                    this.source.start();
+                    
+                    this.source.onended = () => {
+                        this._processQueue();
+                    };
+                } catch (e) {
+                    console.error("Audio decoding error:", e);
+                    this.isPlaying = false;
+                    this._processQueue(); // Try next chunk
+                }
+            }
+            
+            stop() {
+                if (this.source) {
+                    this.source.stop();
+                    this.source.disconnect();
+                    this.source = null;
+                }
+                this.audioQueue = [];
+                this.isPlaying = false;
+            }
+        }
+
+        const player = new AudioPlayer();
 
         async function setupAudio() {
             try {
@@ -42,21 +96,10 @@
                     }
                 };
                 
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 statusEl.textContent = 'Audio ready! Click Start Conversation';
             } catch (error) {
                 statusEl.textContent = `Audio error: ${error.message}`;
             }
-        }
-
-        function playAudioChunk(data) {
-            // Convert binary data to audio buffer
-            audioContext.decodeAudioData(data).then(audioBuffer => {
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-                source.start();
-            });
         }
 
         startBtn.addEventListener('click', async () => {
@@ -75,15 +118,14 @@
             };
             
             ws.onmessage = (event) => {
-                // Check if message is VAD status update
                 if (typeof event.data === 'string') {
-                    if (event.data === 'VAD_START') {
+                    if (event.data.includes("VAD_START")) {
                         vadIndicator.classList.add('vad-active');
-                    } else if (event.data === 'VAD_STOP') {
+                    } else if (event.data.includes("VAD_STOP")) {
                         vadIndicator.classList.remove('vad-active');
                     }
                 } else {
-                    playAudioChunk(event.data);
+                    player.playChunk(event.data);
                 }
             };
             
@@ -92,6 +134,7 @@
                 if (mediaRecorder.state === 'recording') {
                     mediaRecorder.stop();
                 }
+                player.stop();
                 startBtn.disabled = false;
                 stopBtn.disabled = true;
                 vadIndicator.classList.remove('vad-active');
@@ -105,6 +148,7 @@
             if (mediaRecorder && mediaRecorder.state === 'recording') {
                 mediaRecorder.stop();
             }
+            player.stop();
             statusEl.textContent = 'Connection stopped';
             startBtn.disabled = false;
             stopBtn.disabled = true;
